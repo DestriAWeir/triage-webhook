@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: ennrgy-triage-webhook
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    envVars:
+      - key: TENANT_ID
+        sync: false
+      - key: CLIENT_ID
+        sync: false
+      - key: CLIENT_SECRET
+        sync: false
+      - key: TRIAGE_MAILBOX
+        value: triage@ennrgy.com
+      - key: ADO_ORG
+        value: ennrgyai
+      - key: ADO_PROJECT
+        value: Risk360
+      - key: ADO_PAT
+        sync: false
+      - key: ADO_WORK_ITEM_TYPE
+        value: Issue
+    plan: free
+    healthCheckPath: /health
