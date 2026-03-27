@@ -1,5 +1,6 @@
 """
 Triage Email → Azure DevOps Work Item Webhook
+
 Receives Microsoft Graph mail notifications for triage@ennrgy.com,
 creates/updates ADO work items, and sends confirmation emails.
 """
@@ -75,7 +76,6 @@ def get_graph_token():
         CLIENT_ID, authority=authority, client_credential=CLIENT_SECRET
     )
     result = msal_app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
-
     if "access_token" not in result:
         log.error("Failed to acquire Graph token: %s", result.get("error_description", result))
         raise RuntimeError("Could not acquire Graph token")
@@ -196,7 +196,6 @@ def send_confirmation_email(to_email, work_item_id, work_item_title, is_update=F
     """Send a confirmation email from triage@ennrgy.com."""
     action = "updated" if is_update else "created"
     wi_url = f"https://dev.azure.com/{ADO_ORG}/{ADO_PROJECT}/_workitems/edit/{work_item_id}"
-
     subject = f"[Triage] Work item #{work_item_id} {action}: {work_item_title}"
     body = (
         f"<p>Your triage request has been {action}.</p>"
@@ -204,7 +203,6 @@ def send_confirmation_email(to_email, work_item_id, work_item_title, is_update=F
         f'<p><a href="{wi_url}">View in Azure DevOps</a></p>'
         f'<br><p style="color:#888;font-size:12px;">This is an automated message from the Ennrgy triage system.</p>'
     )
-
     message = {
         "message": {
             "subject": subject,
@@ -213,7 +211,6 @@ def send_confirmation_email(to_email, work_item_id, work_item_title, is_update=F
         },
         "saveToSentItems": "false",
     }
-
     url = f"{GRAPH_BASE}/users/{TRIAGE_MAILBOX}/sendMail"
     resp = requests.post(url, json=message, headers=graph_headers(), timeout=HTTP_TIMEOUT)
     if resp.status_code == 202:
@@ -231,7 +228,6 @@ def process_message(message_id):
     url = f"{GRAPH_BASE}/users/{TRIAGE_MAILBOX}/messages/{message_id}"
     params = {"$select": "id,subject,body,from,conversationId,receivedDateTime"}
     resp = requests.get(url, params=params, headers=graph_headers(), timeout=HTTP_TIMEOUT)
-
     if resp.status_code != 200:
         log.error("Could not fetch message %s: %s", message_id, resp.status_code)
         return
@@ -242,6 +238,14 @@ def process_message(message_id):
     body_text = re.sub(r"<[^>]+>", "", body_html)  # strip HTML for source detection
     conversation_id = msg.get("conversationId", "")
     sender_email = msg.get("from", {}).get("emailAddress", {}).get("address", "")
+
+    # --- Skip our own confirmation emails to prevent infinite loops ---
+    if sender_email.lower() == TRIAGE_MAILBOX.lower():
+        log.info("Skipping self-sent message from %s: '%s'", sender_email, subject)
+        return
+    if subject.startswith("[Triage]"):
+        log.info("Skipping triage confirmation email: '%s'", subject)
+        return
 
     cleaned_subj = clean_subject(subject)
     source = detect_source(subject, body_text)
@@ -339,7 +343,6 @@ def subscribe():
     """
     expiration = datetime.now(timezone.utc) + timedelta(minutes=4230)
     notification_url = request.json.get("notificationUrl") if request.is_json else None
-
     if not notification_url:
         return jsonify({"error": "Provide notificationUrl in JSON body"}), 400
 
@@ -350,12 +353,10 @@ def subscribe():
         "expirationDateTime": expiration.strftime("%Y-%m-%dT%H:%M:%S.0000000Z"),
         "clientState": "ennrgy-triage-secret",
     }
-
     resp = requests.post(
         f"{GRAPH_BASE}/subscriptions", json=body, headers=graph_headers(),
         timeout=HTTP_TIMEOUT
     )
-
     if resp.status_code in (200, 201):
         sub = resp.json()
         log.info("Subscription created: id=%s, expires=%s", sub["id"], sub["expirationDateTime"])
@@ -368,7 +369,8 @@ def subscribe():
 @app.route("/renew", methods=["POST"])
 def renew():
     """
-    Renew an existing subscription. Body: {"subscriptionId": "...", "notificationUrl": "..."}
+    Renew an existing subscription.
+    Body: {"subscriptionId": "...", "notificationUrl": "..."}
     """
     data = request.get_json(force=True) if request.is_json else {}
     sub_id = data.get("subscriptionId")
@@ -377,12 +379,11 @@ def renew():
 
     expiration = datetime.now(timezone.utc) + timedelta(minutes=4230)
     body = {"expirationDateTime": expiration.strftime("%Y-%m-%dT%H:%M:%S.0000000Z")}
-
     resp = requests.patch(
-        f"{GRAPH_BASE}/subscriptions/{sub_id}", json=body, headers=graph_headers(),
+        f"{GRAPH_BASE}/subscriptions/{sub_id}",
+        json=body, headers=graph_headers(),
         timeout=HTTP_TIMEOUT
     )
-
     if resp.status_code == 200:
         log.info("Subscription renewed: %s", sub_id)
         return jsonify(resp.json()), 200
