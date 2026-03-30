@@ -1,8 +1,9 @@
 """
-Triage Email â Azure DevOps Work Item Webhook
+Triage Email → Azure DevOps Work Item Webhook
 
 Receives Microsoft Graph mail notifications for triage@ennrgy.com,
 creates/updates ADO work items, and sends confirmation emails.
+Also handles Teams outgoing webhook for @Triage mentions.
 """
 
 import os
@@ -11,6 +12,9 @@ import sys
 import json
 import logging
 import time
+import hmac
+import hashlib
+
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -28,18 +32,20 @@ CLIENT_ID       = os.environ.get("CLIENT_ID", "")
 CLIENT_SECRET   = os.environ.get("CLIENT_SECRET", "")
 TRIAGE_MAILBOX  = os.environ.get("TRIAGE_MAILBOX", "triage@ennrgy.com")
 
-ADO_ORG         = os.environ.get("ADO_ORG", "ennrgyai")
-ADO_PROJECT     = os.environ.get("ADO_PROJECT", "Risk360")
-ADO_PAT         = os.environ.get("ADO_PAT", "")          # Personal Access Token
+ADO_ORG            = os.environ.get("ADO_ORG", "ennrgyai")
+ADO_PROJECT        = os.environ.get("ADO_PROJECT", "Risk360")
+ADO_PAT            = os.environ.get("ADO_PAT", "")   # Personal Access Token
 ADO_WORK_ITEM_TYPE = os.environ.get("ADO_WORK_ITEM_TYPE", "Bug")
 
-GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-ADO_BASE   = f"https://dev.azure.com/{ADO_ORG}/{ADO_PROJECT}/_apis"
+TEAMS_WEBHOOK_SECRET    = os.environ.get("TEAMS_WEBHOOK_SECRET", "")  # Base64 secret from Teams outgoing webhook
+DEFAULT_TEAMS_MSG_COUNT = int(os.environ.get("DEFAULT_TEAMS_MSG_COUNT", "10"))
 
-HTTP_TIMEOUT = 30   # seconds for all outbound HTTP calls
+GRAPH_BASE   = "https://graph.microsoft.com/v1.0"
+ADO_BASE     = f"https://dev.azure.com/{ADO_ORG}/{ADO_PROJECT}/_apis"
+HTTP_TIMEOUT = 30  # seconds for all outbound HTTP calls
 
 # ---------------------------------------------------------------------------
-# Logging â force flush after every message
+# Logging — force flush after every message
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -96,24 +102,26 @@ def graph_headers():
     }
 
 
-
 # ---------------------------------------------------------------------------
 # Deduplication cache — Graph often sends duplicate notifications
 # ---------------------------------------------------------------------------
-_processed_messages = {}  # message_id -> timestamp
-DEDUP_TTL_SECONDS = 300   # ignore duplicates within 5 minutes
+_processed_messages = {}   # message_id -> timestamp
+DEDUP_TTL_SECONDS = 300    # ignore duplicates within 5 minutes
+
 
 def _is_duplicate(message_id):
     """Return True if we've already processed this message_id recently."""
     now = time.time()
     # Clean up expired entries
-    expired = [k for k, v in _processed_messages.items() if now - v > DEDUP_TTL_SECONDS]
+    expired = [k for k, v in _processed_messages.items()
+               if now - v > DEDUP_TTL_SECONDS]
     for k in expired:
         del _processed_messages[k]
     if message_id in _processed_messages:
         return True
     _processed_messages[message_id] = now
     return False
+
 
 # ---------------------------------------------------------------------------
 # Azure DevOps helpers
@@ -138,7 +146,8 @@ def ado_query_by_conversation_id(conversation_id):
         )
     }
     url = f"{ADO_BASE}/wit/wiql?api-version=7.1"
-    resp = requests.post(url, json=wiql, headers=ado_headers(), timeout=HTTP_TIMEOUT)
+    resp = requests.post(url, json=wiql, headers=ado_headers(),
+                         timeout=HTTP_TIMEOUT)
     if resp.status_code == 200:
         items = resp.json().get("workItems", [])
         if items:
@@ -148,7 +157,8 @@ def ado_query_by_conversation_id(conversation_id):
 
 def ado_query_by_subject(cleaned_subject):
     """Fallback: search by cleaned subject within last 30 days."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).strftime(
+        "%Y-%m-%d")
     wiql = {
         "query": (
             f"SELECT [System.Id] FROM WorkItems "
@@ -159,7 +169,8 @@ def ado_query_by_subject(cleaned_subject):
         )
     }
     url = f"{ADO_BASE}/wit/wiql?api-version=7.1"
-    resp = requests.post(url, json=wiql, headers=ado_headers(), timeout=HTTP_TIMEOUT)
+    resp = requests.post(url, json=wiql, headers=ado_headers(),
+                         timeout=HTTP_TIMEOUT)
     if resp.status_code == 200:
         items = resp.json().get("workItems", [])
         if items:
@@ -181,6 +192,7 @@ def download_email_eml(message_id):
                   message_id, resp.status_code, resp.text)
         return None
 
+
 def ado_upload_attachment(file_name, file_bytes):
     """Upload a file to ADO attachment storage. Returns the attachment URL."""
     import base64
@@ -195,7 +207,7 @@ def ado_upload_attachment(file_name, file_bytes):
                          timeout=HTTP_TIMEOUT)
     if resp.status_code in (200, 201):
         attachment_url = resp.json().get("url", "")
-        log.info("Uploaded attachment '%s' â %s", file_name, attachment_url)
+        log.info("Uploaded attachment '%s' -> %s", file_name, attachment_url)
         return attachment_url
     else:
         log.error("Failed to upload attachment '%s': %s %s",
@@ -246,7 +258,7 @@ def attach_email_to_work_item(work_item_id, message_id, sender_email,
     if not attachment_url:
         return False
 
-    comment = (f"Email from {sender_email} â "
+    comment = (f"Email from {sender_email} — "
                f"{received_dt or 'unknown time'}")
     return ado_attach_file_to_work_item(work_item_id, attachment_url, comment)
 
@@ -277,22 +289,22 @@ def fetch_email_attachments(message_id):
 def process_email_attachments_for_inline(message_id):
     """
     Fetch email attachments, upload images to ADO, and return:
-      - inline_html: HTML <img> tags for images to embed in description
+      - inline_html:  HTML <img> tags for images to embed in description
       - file_attachments: list of (ado_url, filename) for non-image files
     """
     import base64 as b64mod
     attachments = fetch_email_attachments(message_id)
     inline_html_parts = []
-    file_attachments = []  # (ado_url, filename) for non-image files
+    file_attachments = []   # (ado_url, filename) for non-image files
 
     for att in attachments:
-        att_name = att.get("name", "attachment")
-        content_type = (att.get("contentType") or "").lower()
+        att_name      = att.get("name", "attachment")
+        content_type  = (att.get("contentType") or "").lower()
         content_bytes_b64 = att.get("contentBytes", "")
-        is_inline = att.get("isInline", False)
+        is_inline     = att.get("isInline", False)
 
         if not content_bytes_b64:
-            log.info("Skipping attachment '%s' (no contentBytes â may be "
+            log.info("Skipping attachment '%s' (no contentBytes — may be "
                      "a reference attachment)", att_name)
             continue
 
@@ -326,29 +338,34 @@ def process_email_attachments_for_inline(message_id):
     inline_html = "\n".join(inline_html_parts)
     return inline_html, file_attachments
 
-def ado_create_work_item(title, body_html, conversation_id, cleaned_subject,
-                         source, sender_email):
+
+def ado_create_work_item(title, body_html, conversation_id,
+                         cleaned_subject, source, sender_email):
     """Create a new ADO work item."""
     patches = [
-        {"op": "add", "path": "/fields/System.Title", "value": title},
-        {"op": "add", "path": "/fields/System.Description", "value": body_html},
+        {"op": "add", "path": "/fields/System.Title",
+         "value": title},
+        {"op": "add", "path": "/fields/System.Description",
+         "value": body_html},
         {"op": "add", "path": "/fields/Custom.TriageConversationID",
          "value": conversation_id or ""},
         {"op": "add", "path": "/fields/Custom.TriageSubject",
          "value": cleaned_subject},
-        {"op": "add", "path": "/fields/Custom.AddTriageSource", "value": source},
+        {"op": "add", "path": "/fields/Custom.AddTriageSource",
+         "value": source},
         {"op": "add", "path": "/fields/Custom.TriageSenderEmail",
          "value": sender_email},
     ]
-
     url = f"{ADO_BASE}/wit/workitems/${ADO_WORK_ITEM_TYPE}?api-version=7.1"
-    resp = requests.post(url, json=patches, headers=ado_headers(), timeout=HTTP_TIMEOUT)
+    resp = requests.post(url, json=patches, headers=ado_headers(),
+                         timeout=HTTP_TIMEOUT)
     if resp.status_code in (200, 201):
         wi = resp.json()
         log.info("Created work item #%s: %s", wi["id"], title)
         return wi
     else:
-        log.error("Failed to create work item: %s %s", resp.status_code, resp.text)
+        log.error("Failed to create work item: %s %s",
+                  resp.status_code, resp.text)
         return None
 
 
@@ -359,7 +376,8 @@ def ado_add_comment(work_item_id, comment_html):
     payload = {"text": comment_html}
     hdrs = ado_headers()
     hdrs["Content-Type"] = "application/json"
-    resp = requests.post(url, json=payload, headers=hdrs, timeout=HTTP_TIMEOUT)
+    resp = requests.post(url, json=payload, headers=hdrs,
+                         timeout=HTTP_TIMEOUT)
     if resp.status_code in (200, 201):
         log.info("Added comment to work item #%s", work_item_id)
         return True
@@ -392,14 +410,16 @@ def send_confirmation_email(to_email, work_item_id, work_item_title,
     action = "updated" if is_update else "created"
     wi_url = (f"https://dev.azure.com/{ADO_ORG}/{ADO_PROJECT}"
               f"/_workitems/edit/{work_item_id}")
+
     subject = f"[Triage] Work item #{work_item_id} {action}: {work_item_title}"
     body = (
         f"<p>Your triage request has been {action}.</p>"
-        f"<p><strong>Work Item:</strong> #{work_item_id} â {work_item_title}</p>"
+        f"<p><strong>Work Item:</strong> #{work_item_id} — {work_item_title}</p>"
         f'<p><a href="{wi_url}">View in Azure DevOps</a></p>'
         f'<br><p style="color:#888;font-size:12px;">'
         f"This is an automated message from the Ennrgy triage system.</p>"
     )
+
     message = {
         "message": {
             "subject": subject,
@@ -418,36 +438,40 @@ def send_confirmation_email(to_email, work_item_id, work_item_title,
         log.error("Failed to send confirmation: %s %s",
                   resp.status_code, resp.text)
 
+
 # ---------------------------------------------------------------------------
-# Core processing: fetch new mail â create/update ADO item â confirm
+# Core processing: fetch new mail -> create/update ADO item -> confirm
 # ---------------------------------------------------------------------------
 def process_message(message_id):
     """Fetch a single mail message and process it into ADO."""
     log.info("Fetching message %s from Graph...", message_id)
     url = f"{GRAPH_BASE}/users/{TRIAGE_MAILBOX}/messages/{message_id}"
     params = {
-        "$select": "id,subject,body,from,conversationId,receivedDateTime,hasAttachments"
+        "$select": ("id,subject,body,from,conversationId,"
+                    "receivedDateTime,hasAttachments")
     }
     resp = requests.get(url, params=params, headers=graph_headers(),
                         timeout=HTTP_TIMEOUT)
     if resp.status_code != 200:
-        log.error("Could not fetch message %s: %s", message_id, resp.status_code)
+        log.error("Could not fetch message %s: %s",
+                  message_id, resp.status_code)
         return
 
     msg = resp.json()
-    subject         = msg.get("subject", "(no subject)")
-    body_html       = msg.get("body", {}).get("content", "")
-    body_text       = re.sub(r"<[^>]+>", "", body_html)   # strip HTML for detection
+    subject       = msg.get("subject", "(no subject)")
+    body_html     = msg.get("body", {}).get("content", "")
+    body_text     = re.sub(r"<[^>]+>", "", body_html)   # strip HTML
     conversation_id = msg.get("conversationId", "")
-    sender_email    = (msg.get("from", {}).get("emailAddress", {})
-                       .get("address", ""))
-    received_dt     = msg.get("receivedDateTime", "")
+    sender_email  = (msg.get("from", {}).get("emailAddress", {})
+                     .get("address", ""))
+    received_dt   = msg.get("receivedDateTime", "")
 
     # --- Skip our own confirmation emails to prevent infinite loops ---
     if sender_email.lower() == TRIAGE_MAILBOX.lower():
         log.info("Skipping self-sent message from %s: '%s'",
                  sender_email, subject)
         return
+
     if subject.startswith("[Triage]"):
         log.info("Skipping triage confirmation email: '%s'", subject)
         return
@@ -458,7 +482,8 @@ def process_message(message_id):
         return
 
     cleaned_subj = clean_subject(subject)
-    source = detect_source(subject, body_text)
+    source       = detect_source(subject, body_text)
+
     log.info("Processing: '%s' from %s [source=%s]",
              subject, sender_email, source)
 
@@ -493,16 +518,15 @@ def process_message(message_id):
         # Attach the actual email (.eml) to the work item
         attach_email_to_work_item(existing_wi_id, message_id,
                                   sender_email, cleaned_subj, received_dt)
-
         # Attach any non-image files
         for ado_url, fname in file_attachments:
             ado_attach_file_to_work_item(existing_wi_id, ado_url,
                                          f"Email attachment: {fname}")
 
-        send_confirmation_email(sender_email, existing_wi_id, cleaned_subj,
-                                is_update=True)
+        send_confirmation_email(sender_email, existing_wi_id,
+                                cleaned_subj, is_update=True)
     else:
-        # Create new work item â embed images in description
+        # Create new work item — embed images in description
         description_html = body_html
         if inline_images_html:
             description_html += (
@@ -524,7 +548,6 @@ def process_message(message_id):
             # Attach the actual email (.eml) to the new work item
             attach_email_to_work_item(wi["id"], message_id,
                                       sender_email, cleaned_subj, received_dt)
-
             # Attach any non-image files
             for ado_url, fname in file_attachments:
                 ado_attach_file_to_work_item(wi["id"], ado_url,
@@ -532,6 +555,104 @@ def process_message(message_id):
 
             send_confirmation_email(sender_email, wi["id"], title,
                                     is_update=False)
+
+
+# ---------------------------------------------------------------------------
+# Teams Outgoing Webhook helpers
+# ---------------------------------------------------------------------------
+
+def verify_teams_hmac(request_body, auth_header):
+    """Verify the HMAC-SHA256 signature from Teams outgoing webhook."""
+    if not TEAMS_WEBHOOK_SECRET:
+        log.warning("TEAMS_WEBHOOK_SECRET not set — skipping HMAC verification")
+        return True
+    if not auth_header or not auth_header.startswith("HMAC "):
+        log.error("Missing or invalid Authorization header for Teams webhook")
+        return False
+    import base64
+    expected_sig = auth_header[5:]   # strip "HMAC " prefix
+    secret_bytes = base64.b64decode(TEAMS_WEBHOOK_SECRET)
+    computed = hmac.new(secret_bytes, request_body, hashlib.sha256)
+    computed_sig = base64.b64encode(computed.digest()).decode()
+    return hmac.compare_digest(expected_sig, computed_sig)
+
+
+def parse_teams_triage_message(text):
+    """
+    Parse: '@Triage <title> [N]'
+    Returns (title, message_count).
+    If the last word is a number, it's treated as the message count.
+    """
+    # Strip the <at>...</at> mention tags
+    cleaned = re.sub(r"<at[^>]*>.*?</at>\s*", "", text or "").strip()
+    # Also strip any remaining HTML tags
+    cleaned = re.sub(r"<[^>]+>", "", cleaned).strip()
+
+    if not cleaned:
+        return "(no title)", DEFAULT_TEAMS_MSG_COUNT
+
+    parts = cleaned.rsplit(None, 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        title = parts[0].strip()
+        count = int(parts[1])
+        count = max(1, min(count, 50))   # clamp 1-50
+        return title or "(no title)", count
+    else:
+        return cleaned, DEFAULT_TEAMS_MSG_COUNT
+
+
+def fetch_channel_messages(team_id, channel_id, count=10):
+    """Fetch the most recent messages from a Teams channel via Graph API."""
+    url = (f"{GRAPH_BASE}/teams/{team_id}/channels/{channel_id}"
+           f"/messages?$top={count}&$orderby=lastModifiedDateTime desc")
+    resp = requests.get(url, headers=graph_headers(), timeout=HTTP_TIMEOUT)
+    if resp.status_code == 200:
+        messages = resp.json().get("value", [])
+        log.info("Fetched %d messages from channel %s",
+                 len(messages), channel_id)
+        return messages
+    else:
+        log.error("Failed to fetch channel messages: %s %s",
+                  resp.status_code, resp.text)
+        return []
+
+
+def format_teams_messages_html(messages):
+    """Format a list of Teams channel messages into HTML for an ADO work item."""
+    if not messages:
+        return "<p><em>No conversation messages available.</em></p>"
+
+    # Reverse so oldest is first (they come newest-first from the API)
+    messages = list(reversed(messages))
+    parts = []
+    for msg in messages:
+        sender = (msg.get("from", {}) or {}).get("user", {}) or {}
+        sender_name = sender.get("displayName", "Unknown")
+        created = msg.get("createdDateTime", "")
+        body_content = (msg.get("body", {}) or {}).get("content", "")
+        content_type = (msg.get("body", {}) or {}).get("contentType", "text")
+
+        # Format timestamp
+        try:
+            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            ts = dt.strftime("%b %d, %I:%M %p")
+        except Exception:
+            ts = created[:19] if created else "unknown time"
+
+        if content_type == "text":
+            body_content = f"<p>{body_content}</p>"
+
+        parts.append(
+            f'<div style="margin:6px 0;padding:8px;'
+            f'border-left:3px solid #6264a7;background:#f5f5f5;">'
+            f'<strong style="color:#6264a7;">{sender_name}</strong> '
+            f'<span style="color:#888;font-size:12px;">{ts}</span>'
+            f'<div style="margin-top:4px;">{body_content}</div>'
+            f'</div>'
+        )
+
+    return "\n".join(parts)
+
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -589,6 +710,108 @@ def webhook():
     return "", 202
 
 
+@app.route("/teams-webhook", methods=["POST"])
+def teams_webhook():
+    """
+    Teams Outgoing Webhook endpoint.
+    Syntax: @Triage <title> [message_count]
+    Creates a Bug in ADO with the channel conversation as context.
+    """
+    raw_body = request.get_data()
+
+    # --- HMAC verification ---
+    auth = request.headers.get("Authorization", "")
+    if TEAMS_WEBHOOK_SECRET and not verify_teams_hmac(raw_body, auth):
+        log.error("Teams webhook HMAC verification failed")
+        return jsonify({"type": "message", "text": "Unauthorized"}), 401
+
+    try:
+        payload = request.get_json(force=True)
+    except Exception:
+        return jsonify({"type": "message", "text": "Bad request"}), 400
+
+    text         = payload.get("text", "")
+    sender       = payload.get("from", {})
+    sender_name  = sender.get("name", "Unknown")
+    sender_aad_id = sender.get("aadObjectId", "")
+    channel_data = payload.get("channelData", {})
+    team_id      = (channel_data.get("team", {}) or {}).get("id", "")
+    channel_id   = (channel_data.get("channel", {}) or {}).get("id", "")
+    conversation_id = payload.get("conversation", {}).get("id", "")
+
+    log.info("Teams webhook from %s: '%s' (team=%s, channel=%s)",
+             sender_name, text[:100], team_id[:20], channel_id[:20])
+
+    # Parse title and message count
+    title, msg_count = parse_teams_triage_message(text)
+    log.info("Parsed: title='%s', msg_count=%d", title, msg_count)
+
+    # Fetch channel conversation for context
+    conversation_html = ""
+    if team_id and channel_id:
+        messages = fetch_channel_messages(team_id, channel_id, msg_count)
+        conversation_html = format_teams_messages_html(messages)
+    else:
+        conversation_html = ("<p><em>Could not fetch conversation — "
+                             "team/channel IDs not available.</em></p>")
+        log.warning("No team_id or channel_id in Teams webhook payload")
+
+    # Build description
+    description = (
+        f"<h3>Teams Triage Request</h3>"
+        f"<p><strong>Requested by:</strong> {sender_name}</p>"
+        f"<p><strong>Channel context ({msg_count} messages):</strong></p>"
+        f"<hr>"
+        f"{conversation_html}"
+    )
+
+    # Look up sender email via Graph (for confirmation)
+    sender_email = ""
+    if sender_aad_id:
+        try:
+            user_url = f"{GRAPH_BASE}/users/{sender_aad_id}"
+            user_resp = requests.get(user_url, headers=graph_headers(),
+                                     timeout=HTTP_TIMEOUT)
+            if user_resp.status_code == 200:
+                sender_email = user_resp.json().get("mail", "")
+        except Exception:
+            pass
+
+    # Create ADO Bug
+    wi = ado_create_work_item(
+        title=f"[Teams] {title}",
+        body_html=description,
+        conversation_id=conversation_id,
+        cleaned_subject=title,
+        source="Teams",
+        sender_email=sender_email or sender_name,
+    )
+
+    if wi:
+        wi_id  = wi["id"]
+        wi_url = (f"https://dev.azure.com/{ADO_ORG}/{ADO_PROJECT}"
+                  f"/_workitems/edit/{wi_id}")
+        log.info("Teams triage created Bug #%s: %s", wi_id, title)
+
+        # Send confirmation email if we have the sender's email
+        if sender_email:
+            send_confirmation_email(sender_email, wi_id,
+                                    f"[Teams] {title}", is_update=False)
+
+        return jsonify({
+            "type": "message",
+            "text": (f"Bug #{wi_id} created: **{title}**\n"
+                     f"({msg_count} messages captured)\n"
+                     f"[View in Azure DevOps]({wi_url})")
+        })
+    else:
+        log.error("Failed to create Teams triage work item")
+        return jsonify({
+            "type": "message",
+            "text": "Failed to create Bug. Check the triage webhook logs."
+        })
+
+
 @app.route("/subscribe", methods=["POST"])
 def subscribe():
     """
@@ -610,6 +833,7 @@ def subscribe():
             "%Y-%m-%dT%H:%M:%S.0000000Z"),
         "clientState": "ennrgy-triage-secret",
     }
+
     resp = requests.post(
         f"{GRAPH_BASE}/subscriptions",
         json=body, headers=graph_headers(), timeout=HTTP_TIMEOUT,
@@ -620,7 +844,8 @@ def subscribe():
                  sub["id"], sub["expirationDateTime"])
         return jsonify(sub), 201
     else:
-        log.error("Subscription failed: %s %s", resp.status_code, resp.text)
+        log.error("Subscription failed: %s %s",
+                  resp.status_code, resp.text)
         return jsonify({"error": resp.text}), resp.status_code
 
 
@@ -640,6 +865,7 @@ def renew():
         "expirationDateTime": expiration.strftime(
             "%Y-%m-%dT%H:%M:%S.0000000Z")
     }
+
     resp = requests.patch(
         f"{GRAPH_BASE}/subscriptions/{sub_id}",
         json=body, headers=graph_headers(), timeout=HTTP_TIMEOUT,
