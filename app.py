@@ -162,7 +162,6 @@ def download_email_eml(message_id):
                   message_id, resp.status_code, resp.text)
         return None
 
-
 def ado_upload_attachment(file_name, file_bytes):
     """Upload a file to ADO attachment storage. Returns the attachment URL."""
     import base64
@@ -232,6 +231,81 @@ def attach_email_to_work_item(work_item_id, message_id, sender_email,
                f"{received_dt or 'unknown time'}")
     return ado_attach_file_to_work_item(work_item_id, attachment_url, comment)
 
+
+# Image content types that should be embedded inline
+IMAGE_CONTENT_TYPES = {
+    "image/png", "image/jpeg", "image/jpg", "image/gif",
+    "image/bmp", "image/webp", "image/tiff",
+}
+
+
+def fetch_email_attachments(message_id):
+    """Fetch attachment metadata for an email from Graph API."""
+    url = (f"{GRAPH_BASE}/users/{TRIAGE_MAILBOX}/messages/{message_id}"
+           f"/attachments")
+    resp = requests.get(url, headers=graph_headers(), timeout=HTTP_TIMEOUT)
+    if resp.status_code == 200:
+        attachments = resp.json().get("value", [])
+        log.info("Found %d attachment(s) on message %s",
+                 len(attachments), message_id)
+        return attachments
+    else:
+        log.error("Failed to fetch attachments for %s: %s %s",
+                  message_id, resp.status_code, resp.text)
+        return []
+
+
+def process_email_attachments_for_inline(message_id):
+    """
+    Fetch email attachments, upload images to ADO, and return:
+      - inline_html: HTML <img> tags for images to embed in description
+      - file_attachments: list of (ado_url, filename) for non-image files
+    """
+    import base64 as b64mod
+    attachments = fetch_email_attachments(message_id)
+    inline_html_parts = []
+    file_attachments = []  # (ado_url, filename) for non-image files
+
+    for att in attachments:
+        att_name = att.get("name", "attachment")
+        content_type = (att.get("contentType") or "").lower()
+        content_bytes_b64 = att.get("contentBytes", "")
+        is_inline = att.get("isInline", False)
+
+        if not content_bytes_b64:
+            log.info("Skipping attachment '%s' (no contentBytes — may be "
+                     "a reference attachment)", att_name)
+            continue
+
+        try:
+            file_bytes = b64mod.b64decode(content_bytes_b64)
+        except Exception:
+            log.error("Failed to decode base64 for attachment '%s'", att_name)
+            continue
+
+        log.info("Processing attachment '%s' (%s, %d bytes, inline=%s)",
+                 att_name, content_type, len(file_bytes), is_inline)
+
+        # Upload to ADO attachment storage
+        ado_url = ado_upload_attachment(att_name, file_bytes)
+        if not ado_url:
+            continue
+
+        if content_type in IMAGE_CONTENT_TYPES:
+            # Build an <img> tag for inline embedding
+            inline_html_parts.append(
+                f'<div style="margin:8px 0;">'
+                f'<img src="{ado_url}" alt="{att_name}" '
+                f'style="max-width:100%;height:auto;" />'
+                f'<br/><em style="color:#666;font-size:12px;">'
+                f'{att_name}</em></div>'
+            )
+        else:
+            # Non-image: will be attached as a file to the work item
+            file_attachments.append((ado_url, att_name))
+
+    inline_html = "\n".join(inline_html_parts)
+    return inline_html, file_attachments
 
 def ado_create_work_item(title, body_html, conversation_id, cleaned_subject,
                          source, sender_email):
@@ -325,7 +399,6 @@ def send_confirmation_email(to_email, work_item_id, work_item_title,
         log.error("Failed to send confirmation: %s %s",
                   resp.status_code, resp.text)
 
-
 # ---------------------------------------------------------------------------
 # Core processing: fetch new mail → create/update ADO item → confirm
 # ---------------------------------------------------------------------------
@@ -334,7 +407,7 @@ def process_message(message_id):
     log.info("Fetching message %s from Graph...", message_id)
     url = f"{GRAPH_BASE}/users/{TRIAGE_MAILBOX}/messages/{message_id}"
     params = {
-        "$select": "id,subject,body,from,conversationId,receivedDateTime"
+        "$select": "id,subject,body,from,conversationId,receivedDateTime,hasAttachments"
     }
     resp = requests.get(url, params=params, headers=graph_headers(),
                         timeout=HTTP_TIMEOUT)
@@ -370,6 +443,14 @@ def process_message(message_id):
     if not existing_wi_id:
         existing_wi_id = ado_query_by_subject(cleaned_subj)
 
+    # --- Extract email attachments: inline images + file attachments ---
+    has_attachments = msg.get("hasAttachments", False)
+    if has_attachments:
+        inline_images_html, file_attachments = \
+            process_email_attachments_for_inline(message_id)
+    else:
+        inline_images_html, file_attachments = "", []
+
     if existing_wi_id:
         # Update existing work item with a new comment
         comment = (
@@ -377,21 +458,39 @@ def process_message(message_id):
             f"({source}, {received_dt or 'unknown time'})</p>"
             f"<hr>{body_html}"
         )
+        # Append inline images to the comment
+        if inline_images_html:
+            comment += (
+                f"\n<hr><p><strong>Attachments:</strong></p>"
+                f"\n{inline_images_html}"
+            )
         ado_add_comment(existing_wi_id, comment)
 
         # Attach the actual email (.eml) to the work item
         attach_email_to_work_item(existing_wi_id, message_id,
                                   sender_email, cleaned_subj, received_dt)
 
+        # Attach any non-image files
+        for ado_url, fname in file_attachments:
+            ado_attach_file_to_work_item(existing_wi_id, ado_url,
+                                         f"Email attachment: {fname}")
+
         send_confirmation_email(sender_email, existing_wi_id, cleaned_subj,
                                 is_update=True)
     else:
-        # Create new work item
+        # Create new work item — embed images in description
+        description_html = body_html
+        if inline_images_html:
+            description_html += (
+                f"\n<hr><p><strong>Attachments:</strong></p>"
+                f"\n{inline_images_html}"
+            )
+
         title = (f"[{source}] {cleaned_subj}"
                  if source != "Email" else cleaned_subj)
         wi = ado_create_work_item(
             title=title,
-            body_html=body_html,
+            body_html=description_html,
             conversation_id=conversation_id,
             cleaned_subject=cleaned_subj,
             source=source,
@@ -402,9 +501,13 @@ def process_message(message_id):
             attach_email_to_work_item(wi["id"], message_id,
                                       sender_email, cleaned_subj, received_dt)
 
+            # Attach any non-image files
+            for ado_url, fname in file_attachments:
+                ado_attach_file_to_work_item(wi["id"], ado_url,
+                                             f"Email attachment: {fname}")
+
             send_confirmation_email(sender_email, wi["id"], title,
                                     is_update=False)
-
 
 # ---------------------------------------------------------------------------
 # Routes
