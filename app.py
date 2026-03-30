@@ -1,5 +1,5 @@
 """
-Triage Email → Azure DevOps Work Item Webhook
+Triage Email â Azure DevOps Work Item Webhook
 
 Receives Microsoft Graph mail notifications for triage@ennrgy.com,
 creates/updates ADO work items, and sends confirmation emails.
@@ -31,7 +31,7 @@ TRIAGE_MAILBOX  = os.environ.get("TRIAGE_MAILBOX", "triage@ennrgy.com")
 ADO_ORG         = os.environ.get("ADO_ORG", "ennrgyai")
 ADO_PROJECT     = os.environ.get("ADO_PROJECT", "Risk360")
 ADO_PAT         = os.environ.get("ADO_PAT", "")          # Personal Access Token
-ADO_WORK_ITEM_TYPE = os.environ.get("ADO_WORK_ITEM_TYPE", "Issue")
+ADO_WORK_ITEM_TYPE = os.environ.get("ADO_WORK_ITEM_TYPE", "Bug")
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 ADO_BASE   = f"https://dev.azure.com/{ADO_ORG}/{ADO_PROJECT}/_apis"
@@ -39,7 +39,7 @@ ADO_BASE   = f"https://dev.azure.com/{ADO_ORG}/{ADO_PROJECT}/_apis"
 HTTP_TIMEOUT = 30   # seconds for all outbound HTTP calls
 
 # ---------------------------------------------------------------------------
-# Logging — force flush after every message
+# Logging â force flush after every message
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -95,6 +95,25 @@ def graph_headers():
         "Content-Type": "application/json",
     }
 
+
+
+# ---------------------------------------------------------------------------
+# Deduplication cache — Graph often sends duplicate notifications
+# ---------------------------------------------------------------------------
+_processed_messages = {}  # message_id -> timestamp
+DEDUP_TTL_SECONDS = 300   # ignore duplicates within 5 minutes
+
+def _is_duplicate(message_id):
+    """Return True if we've already processed this message_id recently."""
+    now = time.time()
+    # Clean up expired entries
+    expired = [k for k, v in _processed_messages.items() if now - v > DEDUP_TTL_SECONDS]
+    for k in expired:
+        del _processed_messages[k]
+    if message_id in _processed_messages:
+        return True
+    _processed_messages[message_id] = now
+    return False
 
 # ---------------------------------------------------------------------------
 # Azure DevOps helpers
@@ -176,7 +195,7 @@ def ado_upload_attachment(file_name, file_bytes):
                          timeout=HTTP_TIMEOUT)
     if resp.status_code in (200, 201):
         attachment_url = resp.json().get("url", "")
-        log.info("Uploaded attachment '%s' → %s", file_name, attachment_url)
+        log.info("Uploaded attachment '%s' â %s", file_name, attachment_url)
         return attachment_url
     else:
         log.error("Failed to upload attachment '%s': %s %s",
@@ -227,7 +246,7 @@ def attach_email_to_work_item(work_item_id, message_id, sender_email,
     if not attachment_url:
         return False
 
-    comment = (f"Email from {sender_email} — "
+    comment = (f"Email from {sender_email} â "
                f"{received_dt or 'unknown time'}")
     return ado_attach_file_to_work_item(work_item_id, attachment_url, comment)
 
@@ -273,7 +292,7 @@ def process_email_attachments_for_inline(message_id):
         is_inline = att.get("isInline", False)
 
         if not content_bytes_b64:
-            log.info("Skipping attachment '%s' (no contentBytes — may be "
+            log.info("Skipping attachment '%s' (no contentBytes â may be "
                      "a reference attachment)", att_name)
             continue
 
@@ -376,7 +395,7 @@ def send_confirmation_email(to_email, work_item_id, work_item_title,
     subject = f"[Triage] Work item #{work_item_id} {action}: {work_item_title}"
     body = (
         f"<p>Your triage request has been {action}.</p>"
-        f"<p><strong>Work Item:</strong> #{work_item_id} — {work_item_title}</p>"
+        f"<p><strong>Work Item:</strong> #{work_item_id} â {work_item_title}</p>"
         f'<p><a href="{wi_url}">View in Azure DevOps</a></p>'
         f'<br><p style="color:#888;font-size:12px;">'
         f"This is an automated message from the Ennrgy triage system.</p>"
@@ -400,7 +419,7 @@ def send_confirmation_email(to_email, work_item_id, work_item_title,
                   resp.status_code, resp.text)
 
 # ---------------------------------------------------------------------------
-# Core processing: fetch new mail → create/update ADO item → confirm
+# Core processing: fetch new mail â create/update ADO item â confirm
 # ---------------------------------------------------------------------------
 def process_message(message_id):
     """Fetch a single mail message and process it into ADO."""
@@ -431,6 +450,11 @@ def process_message(message_id):
         return
     if subject.startswith("[Triage]"):
         log.info("Skipping triage confirmation email: '%s'", subject)
+        return
+
+    # --- Deduplicate: skip if we already processed this message_id ---
+    if _is_duplicate(message_id):
+        log.info("Skipping duplicate notification for message %s", message_id)
         return
 
     cleaned_subj = clean_subject(subject)
@@ -478,7 +502,7 @@ def process_message(message_id):
         send_confirmation_email(sender_email, existing_wi_id, cleaned_subj,
                                 is_update=True)
     else:
-        # Create new work item — embed images in description
+        # Create new work item â embed images in description
         description_html = body_html
         if inline_images_html:
             description_html += (
