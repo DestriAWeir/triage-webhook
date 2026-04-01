@@ -338,6 +338,25 @@ def process_email_attachments_for_inline(message_id):
     return inline_html, file_attachments, cid_map
 
 
+def extract_body_content(html):
+    """Extract content from inside <body> tags, stripping outer HTML document
+    structure.  Graph API returns email bodies as full HTML documents with
+    <html>, <head>, <style> etc.  ADO's Description field expects an HTML
+    *fragment*, so passing a full document causes ADO to silently discard it.
+    """
+    if not html:
+        return html
+
+    # Try to find <body ...> ... </body>
+    m = re.search(r'<body[^>]*>(.*)</body>', html,
+                  flags=re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    # If no <body> tag, return as-is (already a fragment)
+    return html
+
+
 def replace_cid_references(body_html, cid_map):
     """Replace cid: image references in email HTML with ADO attachment URLs.
 
@@ -474,8 +493,11 @@ def process_message(message_id):
 
     msg = resp.json()
     subject        = msg.get("subject", "(no subject)")
-    body_html      = msg.get("body", {}).get("content", "")
-    body_text      = re.sub(r"<[^>]+>", "", body_html)   # strip HTML for detection
+    body_html_raw  = msg.get("body", {}).get("content", "")
+    body_html      = extract_body_content(body_html_raw)  # strip <html>/<head>/<body> wrapper
+    log.info("Body HTML: raw=%d chars → extracted=%d chars",
+             len(body_html_raw), len(body_html))
+    body_text      = re.sub(r"<[^>]+>", "", body_html)    # strip HTML for detection
     conversation_id = msg.get("conversationId", "")
     sender_email   = (msg.get("from", {}).get("emailAddress", {})
                       .get("address", ""))
