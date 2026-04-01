@@ -281,17 +281,21 @@ def process_email_attachments_for_inline(message_id):
     Fetch email attachments, upload images to ADO, and return:
       - inline_html: HTML <img> tags for images to embed in description
       - file_attachments: list of (ado_url, filename) for non-image files
+      - cid_map: dict mapping content_id -> ado_url for replacing cid:
+                 references in the email body HTML
     """
     import base64 as b64mod
     attachments = fetch_email_attachments(message_id)
     inline_html_parts = []
     file_attachments = []   # (ado_url, filename) for non-image files
+    cid_map = {}            # content_id -> ado_url
 
     for att in attachments:
         att_name = att.get("name", "attachment")
         content_type = (att.get("contentType") or "").lower()
         content_bytes_b64 = att.get("contentBytes", "")
         is_inline = att.get("isInline", False)
+        content_id = att.get("contentId", "")
 
         if not content_bytes_b64:
             log.info("Skipping attachment '%s' (no contentBytes — may be "
@@ -304,8 +308,9 @@ def process_email_attachments_for_inline(message_id):
             log.error("Failed to decode base64 for attachment '%s'", att_name)
             continue
 
-        log.info("Processing attachment '%s' (%s, %d bytes, inline=%s)",
-                 att_name, content_type, len(file_bytes), is_inline)
+        log.info("Processing attachment '%s' (%s, %d bytes, inline=%s, "
+                 "contentId=%s)", att_name, content_type, len(file_bytes),
+                 is_inline, content_id)
 
         # Upload to ADO attachment storage
         ado_url = ado_upload_attachment(att_name, file_bytes)
@@ -313,7 +318,11 @@ def process_email_attachments_for_inline(message_id):
             continue
 
         if content_type in IMAGE_CONTENT_TYPES:
-            # Build an <img> tag for inline embedding
+            # Track cid: -> ADO URL mapping for replacing in body HTML
+            if content_id:
+                cid_map[content_id] = ado_url
+            # Build an <img> tag for inline embedding (used as fallback
+            # for images not referenced via cid: in the body)
             inline_html_parts.append(
                 f'<div style="margin:8px 0;">'
                 f'<img src="{ado_url}" alt="{att_name}" '
@@ -326,7 +335,28 @@ def process_email_attachments_for_inline(message_id):
             file_attachments.append((ado_url, att_name))
 
     inline_html = "\n".join(inline_html_parts)
-    return inline_html, file_attachments
+    return inline_html, file_attachments, cid_map
+
+
+def replace_cid_references(body_html, cid_map):
+    """Replace cid: image references in email HTML with ADO attachment URLs.
+
+    Email clients embed inline images as <img src="cid:content_id">.
+    This swaps those with the actual ADO attachment URLs so images
+    render correctly in ADO work item descriptions.
+    """
+    if not cid_map or not body_html:
+        return body_html
+
+    for content_id, ado_url in cid_map.items():
+        # Match both cid:content_id and cid:content_id@... forms
+        body_html = re.sub(
+            rf'src="cid:{re.escape(content_id)}[^"]*"',
+            f'src="{ado_url}"',
+            body_html,
+            flags=re.IGNORECASE,
+        )
+    return body_html
 
 
 def ado_create_work_item(title, body_html, conversation_id, cleaned_subject,
@@ -478,10 +508,16 @@ def process_message(message_id):
     # --- Extract email attachments: inline images + file attachments ---
     has_attachments = msg.get("hasAttachments", False)
     if has_attachments:
-        inline_images_html, file_attachments = \
+        inline_images_html, file_attachments, cid_map = \
             process_email_attachments_for_inline(message_id)
     else:
-        inline_images_html, file_attachments = "", []
+        inline_images_html, file_attachments, cid_map = "", [], {}
+
+    # Replace cid: references in body HTML with ADO attachment URLs
+    # so inline images render correctly in ADO descriptions
+    body_html = replace_cid_references(body_html, cid_map)
+    log.info("Body HTML length after cid replacement: %d chars, "
+             "cid replacements: %d", len(body_html), len(cid_map))
 
     if existing_wi_id:
         # Update existing work item with a new comment
@@ -490,7 +526,7 @@ def process_message(message_id):
             f"({source}, {received_dt or 'unknown time'})</p>"
             f"<hr>{body_html}"
         )
-        # Append inline images to the comment
+        # Append any images that weren't referenced via cid: in the body
         if inline_images_html:
             comment += (
                 f"\n<hr><p><strong>Attachments:</strong></p>"
@@ -507,8 +543,10 @@ def process_message(message_id):
         send_confirmation_email(sender_email, existing_wi_id, cleaned_subj,
                                 is_update=True)
     else:
-        # Create new work item — embed images in description
+        # Create new work item — body with cid: refs already replaced
         description_html = body_html
+        # Also append image gallery for any images (ensures visibility
+        # even if cid: replacement covered them — ADO handles duplicates)
         if inline_images_html:
             description_html += (
                 f"\n<hr><p><strong>Attachments:</strong></p>"
