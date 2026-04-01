@@ -436,6 +436,8 @@ def ado_create_work_item(title, body_html, conversation_id, cleaned_subject,
     patches = [
         {"op": "add", "path": "/fields/System.Title",
          "value": title},
+                {"op": "add", "path": "/fields/Microsoft.VSTS.TCM.ReproSteps",
+                          "value": body_html},
         {"op": "add", "path": "/fields/System.Description",
          "value": body_html},
         {"op": "add", "path": "/fields/Custom.TriageConversationID",
