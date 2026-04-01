@@ -357,6 +357,72 @@ def extract_body_content(html):
     return html
 
 
+def sanitize_html_for_ado(html):
+    """Aggressively clean Outlook/Graph email HTML for ADO compatibility.
+
+    ADO's Description field supports a limited subset of HTML.  Outlook
+    emails contain Office-specific XML namespaces (o:p, v:shape, w:*),
+    conditional comments, <style> blocks, and other elements that cause
+    ADO to silently discard the entire Description value.
+    """
+    if not html:
+        return html
+
+    # 1. Remove conditional comments  <!--[if ...]>...<![endif]-->
+    html = re.sub(
+        r'<!--\[if[^\]]*\]>.*?<!\[endif\]-->',
+        '', html, flags=re.DOTALL | re.IGNORECASE)
+    # Also remove the alternate form: <!--[if ...]-->...<![endif]-->
+    html = re.sub(
+        r'<!--\[if[^\]]*\]-->.*?<!--\[endif\]-->',
+        '', html, flags=re.DOTALL | re.IGNORECASE)
+
+    # 2. Remove regular HTML comments
+    html = re.sub(r'<!--.*?-->', '', html, flags=re.DOTALL)
+
+    # 3. Remove <xml>...</xml> blocks (Office XML islands)
+    html = re.sub(r'<xml>.*?</xml>', '', html, flags=re.DOTALL | re.IGNORECASE)
+
+    # 4. Remove <style>...</style> blocks
+    html = re.sub(r'<style[^>]*>.*?</style>', '', html,
+                  flags=re.DOTALL | re.IGNORECASE)
+
+    # 5. Remove <meta> and <link> tags
+    html = re.sub(r'<meta[^>]*/?>',  '', html, flags=re.IGNORECASE)
+    html = re.sub(r'<link[^>]*/?>',  '', html, flags=re.IGNORECASE)
+
+    # 6. Remove Office namespace elements but KEEP their text content
+    #    e.g. <o:p>text</o:p>  →  text
+    html = re.sub(r'</?[ovw]:[^>]*>', '', html, flags=re.IGNORECASE)
+
+    # 7. Remove XML processing instructions  <?xml ... ?>
+    html = re.sub(r'<\?xml[^>]*\?>', '', html, flags=re.IGNORECASE)
+
+    # 8. Strip class= attributes (Office-specific class names)
+    html = re.sub(r'\s+class="[^"]*"', '', html, flags=re.IGNORECASE)
+
+    # 9. Strip XML namespace declarations  xmlns:o="..." etc.
+    html = re.sub(r'\s+xmlns[^=]*="[^"]*"', '', html, flags=re.IGNORECASE)
+
+    # 10. Strip mso-* CSS properties from inline style attributes
+    #     but keep other inline styles intact
+    def _clean_style(m):
+        style = m.group(1)
+        # Remove mso-* properties
+        style = re.sub(r'mso-[^;:"]*:[^;"]*;?\s*', '', style)
+        style = style.strip().rstrip(';').strip()
+        if style:
+            return f' style="{style}"'
+        return ''
+    html = re.sub(r'\s+style="([^"]*)"', _clean_style, html,
+                  flags=re.IGNORECASE)
+
+    # 11. Clean up excessive whitespace / blank lines
+    html = re.sub(r'(\s*\n){3,}', '\n\n', html)
+
+    return html.strip()
+
+
 def replace_cid_references(body_html, cid_map):
     """Replace cid: image references in email HTML with ADO attachment URLs.
 
@@ -395,11 +461,19 @@ def ado_create_work_item(title, body_html, conversation_id, cleaned_subject,
         {"op": "add", "path": "/fields/Custom.TriageSenderEmail",
          "value": sender_email},
     ]
+    log.info("Creating ADO work item — Description length: %d chars",
+             len(body_html))
+    # Log first 300 chars of description for debugging
+    log.info("Description preview: %.300s", body_html[:300] if body_html else "(empty)")
+
     url = f"{ADO_BASE}/wit/workitems/${ADO_WORK_ITEM_TYPE}?api-version=7.1"
     resp = requests.post(url, json=patches, headers=ado_headers(), timeout=HTTP_TIMEOUT)
     if resp.status_code in (200, 201):
         wi = resp.json()
-        log.info("Created work item #%s: %s", wi["id"], title)
+        # Check if Description was actually set in the response
+        desc_val = wi.get("fields", {}).get("System.Description", "")
+        log.info("Created work item #%s: %s  (Description in response: %d chars)",
+                 wi["id"], title, len(desc_val or ""))
         return wi
     else:
         log.error("Failed to create work item: %s %s",
@@ -494,10 +568,11 @@ def process_message(message_id):
     msg = resp.json()
     subject        = msg.get("subject", "(no subject)")
     body_html_raw  = msg.get("body", {}).get("content", "")
-    body_html      = extract_body_content(body_html_raw)  # strip <html>/<head>/<body> wrapper
-    log.info("Body HTML: raw=%d chars → extracted=%d chars",
+    body_html      = extract_body_content(body_html_raw)   # strip <html>/<head>/<body> wrapper
+    body_html      = sanitize_html_for_ado(body_html)      # remove Office XML, styles, etc.
+    log.info("Body HTML: raw=%d chars → sanitized=%d chars",
              len(body_html_raw), len(body_html))
-    body_text      = re.sub(r"<[^>]+>", "", body_html)    # strip HTML for detection
+    body_text      = re.sub(r"<[^>]+>", "", body_html)     # strip HTML for detection
     conversation_id = msg.get("conversationId", "")
     sender_email   = (msg.get("from", {}).get("emailAddress", {})
                       .get("address", ""))
