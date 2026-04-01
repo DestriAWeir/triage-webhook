@@ -338,89 +338,75 @@ def process_email_attachments_for_inline(message_id):
     return inline_html, file_attachments, cid_map
 
 
-def extract_body_content(html):
-    """Extract content from inside <body> tags, stripping outer HTML document
-    structure.  Graph API returns email bodies as full HTML documents with
-    <html>, <head>, <style> etc.  ADO's Description field expects an HTML
-    *fragment*, so passing a full document causes ADO to silently discard it.
+def build_clean_description(body_html_raw, cid_map, inline_images_html):
+    """Build a clean, simple HTML description that ADO can reliably render.
+
+    Instead of trying to sanitize complex Outlook email HTML (which ADO's
+    UI renderer silently discards even when the API accepts it), we:
+      1. Extract plain text from the email body
+      2. Rebuild simple HTML using only basic tags ADO supports
+      3. Insert inline images using the ADO attachment URLs from cid_map
     """
-    if not html:
-        return html
+    if not body_html_raw:
+        return inline_images_html or ""
 
-    # Try to find <body ...> ... </body>
-    m = re.search(r'<body[^>]*>(.*)</body>', html,
+    # --- Step 1: extract the <body> content if wrapped in full HTML doc ---
+    m = re.search(r'<body[^>]*>(.*)</body>', body_html_raw,
                   flags=re.DOTALL | re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
+    body_fragment = m.group(1) if m else body_html_raw
 
-    # If no <body> tag, return as-is (already a fragment)
-    return html
+    # --- Step 2: replace cid: refs with ADO URLs BEFORE stripping HTML ---
+    #     This lets us preserve <img> tags that reference uploaded images.
+    if cid_map:
+        for content_id, ado_url in cid_map.items():
+            body_fragment = re.sub(
+                rf'<img[^>]*src="cid:{re.escape(content_id)}[^"]*"[^>]*/?>',
+                f'<img src="{ado_url}" style="max-width:100%;" />',
+                body_fragment,
+                flags=re.IGNORECASE,
+            )
 
+    # --- Step 3: extract text and images in document order ---
+    #     Walk through the HTML, pulling out text runs and <img> tags.
+    parts = []
+    pos = 0
+    # Find every <img> tag (already converted to ADO URLs above)
+    for img_m in re.finditer(r'<img\s[^>]*src="(https://dev\.azure\.com/[^"]+)"[^>]*/?>',
+                             body_fragment, flags=re.IGNORECASE):
+        # Grab text between previous position and this image
+        text_chunk = body_fragment[pos:img_m.start()]
+        text_only = re.sub(r'<[^>]+>', ' ', text_chunk)
+        text_only = re.sub(r'[ \t]+', ' ', text_only).strip()
+        text_only = text_only.replace('&nbsp;', ' ')
+        if text_only:
+            # Convert line breaks to <br> and wrap in <p>
+            paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text_only) if p.strip()]
+            for para in paragraphs:
+                parts.append(f"<p>{para}</p>")
+        # Add the image with simple, clean markup
+        parts.append(
+            f'<p><img src="{img_m.group(1)}" '
+            f'style="max-width:100%;height:auto;" /></p>'
+        )
+        pos = img_m.end()
 
-def sanitize_html_for_ado(html):
-    """Aggressively clean Outlook/Graph email HTML for ADO compatibility.
+    # Grab any trailing text after the last image
+    text_chunk = body_fragment[pos:]
+    text_only = re.sub(r'<[^>]+>', ' ', text_chunk)
+    text_only = re.sub(r'[ \t]+', ' ', text_only).strip()
+    text_only = text_only.replace('&nbsp;', ' ')
+    if text_only:
+        paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text_only) if p.strip()]
+        for para in paragraphs:
+            parts.append(f"<p>{para}</p>")
 
-    ADO's Description field supports a limited subset of HTML.  Outlook
-    emails contain Office-specific XML namespaces (o:p, v:shape, w:*),
-    conditional comments, <style> blocks, and other elements that cause
-    ADO to silently discard the entire Description value.
-    """
-    if not html:
-        return html
+    # --- Step 4: if no ADO-URL images were found in the body, append
+    #     the gallery of all uploaded images as a fallback ---
+    if inline_images_html and not any('dev.azure.com' in p for p in parts):
+        parts.append(inline_images_html)
 
-    # 1. Remove conditional comments  <!--[if ...]>...<![endif]-->
-    html = re.sub(
-        r'<!--\[if[^\]]*\]>.*?<!\[endif\]-->',
-        '', html, flags=re.DOTALL | re.IGNORECASE)
-    # Also remove the alternate form: <!--[if ...]-->...<![endif]-->
-    html = re.sub(
-        r'<!--\[if[^\]]*\]-->.*?<!--\[endif\]-->',
-        '', html, flags=re.DOTALL | re.IGNORECASE)
-
-    # 2. Remove regular HTML comments
-    html = re.sub(r'<!--.*?-->', '', html, flags=re.DOTALL)
-
-    # 3. Remove <xml>...</xml> blocks (Office XML islands)
-    html = re.sub(r'<xml>.*?</xml>', '', html, flags=re.DOTALL | re.IGNORECASE)
-
-    # 4. Remove <style>...</style> blocks
-    html = re.sub(r'<style[^>]*>.*?</style>', '', html,
-                  flags=re.DOTALL | re.IGNORECASE)
-
-    # 5. Remove <meta> and <link> tags
-    html = re.sub(r'<meta[^>]*/?>',  '', html, flags=re.IGNORECASE)
-    html = re.sub(r'<link[^>]*/?>',  '', html, flags=re.IGNORECASE)
-
-    # 6. Remove Office namespace elements but KEEP their text content
-    #    e.g. <o:p>text</o:p>  →  text
-    html = re.sub(r'</?[ovw]:[^>]*>', '', html, flags=re.IGNORECASE)
-
-    # 7. Remove XML processing instructions  <?xml ... ?>
-    html = re.sub(r'<\?xml[^>]*\?>', '', html, flags=re.IGNORECASE)
-
-    # 8. Strip class= attributes (Office-specific class names)
-    html = re.sub(r'\s+class="[^"]*"', '', html, flags=re.IGNORECASE)
-
-    # 9. Strip XML namespace declarations  xmlns:o="..." etc.
-    html = re.sub(r'\s+xmlns[^=]*="[^"]*"', '', html, flags=re.IGNORECASE)
-
-    # 10. Strip mso-* CSS properties from inline style attributes
-    #     but keep other inline styles intact
-    def _clean_style(m):
-        style = m.group(1)
-        # Remove mso-* properties
-        style = re.sub(r'mso-[^;:"]*:[^;"]*;?\s*', '', style)
-        style = style.strip().rstrip(';').strip()
-        if style:
-            return f' style="{style}"'
-        return ''
-    html = re.sub(r'\s+style="([^"]*)"', _clean_style, html,
-                  flags=re.IGNORECASE)
-
-    # 11. Clean up excessive whitespace / blank lines
-    html = re.sub(r'(\s*\n){3,}', '\n\n', html)
-
-    return html.strip()
+    result = "\n".join(parts) if parts else "(No text content in email)"
+    return result
 
 
 def replace_cid_references(body_html, cid_map):
@@ -568,11 +554,8 @@ def process_message(message_id):
     msg = resp.json()
     subject        = msg.get("subject", "(no subject)")
     body_html_raw  = msg.get("body", {}).get("content", "")
-    body_html      = extract_body_content(body_html_raw)   # strip <html>/<head>/<body> wrapper
-    body_html      = sanitize_html_for_ado(body_html)      # remove Office XML, styles, etc.
-    log.info("Body HTML: raw=%d chars → sanitized=%d chars",
-             len(body_html_raw), len(body_html))
-    body_text      = re.sub(r"<[^>]+>", "", body_html)     # strip HTML for detection
+    body_text      = re.sub(r"<[^>]+>", " ", body_html_raw)  # strip HTML for detection
+    body_text      = re.sub(r"\s+", " ", body_text).strip()
     conversation_id = msg.get("conversationId", "")
     sender_email   = (msg.get("from", {}).get("emailAddress", {})
                       .get("address", ""))
@@ -610,25 +593,22 @@ def process_message(message_id):
     else:
         inline_images_html, file_attachments, cid_map = "", [], {}
 
-    # Replace cid: references in body HTML with ADO attachment URLs
-    # so inline images render correctly in ADO descriptions
-    body_html = replace_cid_references(body_html, cid_map)
-    log.info("Body HTML length after cid replacement: %d chars, "
-             "cid replacements: %d", len(body_html), len(cid_map))
+    # Build a clean HTML description from the email content.
+    # Outlook email HTML is too complex for ADO's renderer, so we
+    # extract the text and images and rebuild simple HTML.
+    clean_description = build_clean_description(
+        body_html_raw, cid_map, inline_images_html)
+    log.info("Clean description built: %d chars (raw email: %d chars, "
+             "cid entries: %d)", len(clean_description),
+             len(body_html_raw), len(cid_map))
 
     if existing_wi_id:
         # Update existing work item with a new comment
         comment = (
             f"<p><strong>New message from {sender_email}</strong> "
             f"({source}, {received_dt or 'unknown time'})</p>"
-            f"<hr>{body_html}"
+            f"<hr>{clean_description}"
         )
-        # Append any images that weren't referenced via cid: in the body
-        if inline_images_html:
-            comment += (
-                f"\n<hr><p><strong>Attachments:</strong></p>"
-                f"\n{inline_images_html}"
-            )
         ado_add_comment(existing_wi_id, comment)
         # Attach the actual email (.eml) to the work item
         attach_email_to_work_item(existing_wi_id, message_id, sender_email,
@@ -640,15 +620,8 @@ def process_message(message_id):
         send_confirmation_email(sender_email, existing_wi_id, cleaned_subj,
                                 is_update=True)
     else:
-        # Create new work item — body with cid: refs already replaced
-        description_html = body_html
-        # Also append image gallery for any images (ensures visibility
-        # even if cid: replacement covered them — ADO handles duplicates)
-        if inline_images_html:
-            description_html += (
-                f"\n<hr><p><strong>Attachments:</strong></p>"
-                f"\n{inline_images_html}"
-            )
+        # Create new work item with clean description
+        description_html = clean_description
         title = (f"[{source}] {cleaned_subj}" if source != "Email"
                  else cleaned_subj)
         wi = ado_create_work_item(
