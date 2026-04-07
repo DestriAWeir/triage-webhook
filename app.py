@@ -367,8 +367,11 @@ def detect_source(subject, body):
     return "Email"
 
 
+HUBSPOT_BCC = os.environ.get("HUBSPOT_BCC", "47665379@bcc.hubspot.com")
+
+
 def send_confirmation_email(to_email, work_item_id, work_item_title,
-                            is_update=False, source="Email"):
+                            is_update=False):
     """Send a confirmation email from triage@ennrgy.com."""
     action = "updated" if is_update else "created"
     wi_url = (f"https://dev.azure.com/{ADO_ORG}/{ADO_PROJECT}"
@@ -386,16 +389,13 @@ def send_confirmation_email(to_email, work_item_id, work_item_title,
             "subject": subject,
             "body": {"contentType": "HTML", "content": body},
             "toRecipients": [{"emailAddress": {"address": to_email}}],
+            "bccRecipients": [
+                {"emailAddress": {"address": HUBSPOT_BCC}}
+            ],
         },
         "saveToSentItems": "false",
     }
-
-    # BCC HubSpot so the confirmation is logged in the CRM contact timeline
-    if source == "HubSpot":
-        message["message"]["bccRecipients"] = [
-            {"emailAddress": {"address": "47665379@bcc.hubspot.com"}}
-        ]
-        log.info("Adding HubSpot BCC for CRM logging")
+    log.info("BCC'ing HubSpot (%s) on confirmation email", HUBSPOT_BCC)
     url = f"{GRAPH_BASE}/users/{TRIAGE_MAILBOX}/sendMail"
     resp = requests.post(url, json=message, headers=graph_headers(),
                          timeout=HTTP_TIMEOUT)
@@ -483,7 +483,7 @@ def process_message(message_id):
                                          f"Email attachment: {fname}")
 
         send_confirmation_email(sender_email, existing_wi_id, cleaned_subj,
-                                is_update=True, source=source)
+                                is_update=True)
     else:
         # Create new work item — embed images in description
         description_html = body_html
@@ -514,7 +514,7 @@ def process_message(message_id):
                                              f"Email attachment: {fname}")
 
             send_confirmation_email(sender_email, wi["id"], title,
-                                    is_update=False, source=source)
+                                    is_update=False)
 
 # ---------------------------------------------------------------------------
 # Routes
