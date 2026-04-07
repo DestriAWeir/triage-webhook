@@ -30,8 +30,8 @@ TRIAGE_MAILBOX  = os.environ.get("TRIAGE_MAILBOX", "triage@ennrgy.com")
 
 ADO_ORG         = os.environ.get("ADO_ORG", "ennrgyai")
 ADO_PROJECT     = os.environ.get("ADO_PROJECT", "Risk360")
-ADO_PAT         = os.environ.get("ADO_PAT", "")           # Personal Access Token
-ADO_WORK_ITEM_TYPE = os.environ.get("ADO_WORK_ITEM_TYPE", "Bug")
+ADO_PAT         = os.environ.get("ADO_PAT", "")          # Personal Access Token
+ADO_WORK_ITEM_TYPE = os.environ.get("ADO_WORK_ITEM_TYPE", "Issue")
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 ADO_BASE   = f"https://dev.azure.com/{ADO_ORG}/{ADO_PROJECT}/_apis"
@@ -94,28 +94,6 @@ def graph_headers():
         "Authorization": f"Bearer {get_graph_token()}",
         "Content-Type": "application/json",
     }
-
-
-# ---------------------------------------------------------------------------
-# Deduplication cache — Graph often sends duplicate notifications
-# ---------------------------------------------------------------------------
-_processed_messages = {}          # message_id -> timestamp
-DEDUP_TTL_SECONDS = 300           # ignore duplicates within 5 minutes
-
-
-def _is_duplicate(message_id):
-    """Return True if we've already processed this message_id recently."""
-    now = time.time()
-    # Clean up expired entries
-    expired = [k for k, v in _processed_messages.items()
-               if now - v > DEDUP_TTL_SECONDS]
-    for k in expired:
-        del _processed_messages[k]
-
-    if message_id in _processed_messages:
-        return True
-    _processed_messages[message_id] = now
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +162,6 @@ def download_email_eml(message_id):
                   message_id, resp.status_code, resp.text)
         return None
 
-
 def ado_upload_attachment(file_name, file_bytes):
     """Upload a file to ADO attachment storage. Returns the attachment URL."""
     import base64
@@ -195,7 +172,8 @@ def ado_upload_attachment(file_name, file_bytes):
         "Authorization": f"Basic {encoded_pat}",
         "Content-Type": "application/octet-stream",
     }
-    resp = requests.post(url, data=file_bytes, headers=hdrs, timeout=HTTP_TIMEOUT)
+    resp = requests.post(url, data=file_bytes, headers=hdrs,
+                         timeout=HTTP_TIMEOUT)
     if resp.status_code in (200, 201):
         attachment_url = resp.json().get("url", "")
         log.info("Uploaded attachment '%s' → %s", file_name, attachment_url)
@@ -222,7 +200,8 @@ def ado_attach_file_to_work_item(work_item_id, attachment_url, comment=""):
         }
     ]
     url = f"{ADO_BASE}/wit/workitems/{work_item_id}?api-version=7.1"
-    resp = requests.patch(url, json=patches, headers=ado_headers(), timeout=HTTP_TIMEOUT)
+    resp = requests.patch(url, json=patches, headers=ado_headers(),
+                          timeout=HTTP_TIMEOUT)
     if resp.status_code == 200:
         log.info("Attached file to work item #%s", work_item_id)
         return True
@@ -233,7 +212,7 @@ def ado_attach_file_to_work_item(work_item_id, attachment_url, comment=""):
 
 
 def attach_email_to_work_item(work_item_id, message_id, sender_email,
-                               subject, received_dt):
+                              subject, received_dt):
     """Download an email as .eml and attach it to an ADO work item."""
     eml_bytes = download_email_eml(message_id)
     if not eml_bytes:
@@ -281,21 +260,17 @@ def process_email_attachments_for_inline(message_id):
     Fetch email attachments, upload images to ADO, and return:
       - inline_html: HTML <img> tags for images to embed in description
       - file_attachments: list of (ado_url, filename) for non-image files
-      - cid_map: dict mapping content_id -> ado_url for replacing cid:
-                 references in the email body HTML
     """
     import base64 as b64mod
     attachments = fetch_email_attachments(message_id)
     inline_html_parts = []
-    file_attachments = []   # (ado_url, filename) for non-image files
-    cid_map = {}            # content_id -> ado_url
+    file_attachments = []  # (ado_url, filename) for non-image files
 
     for att in attachments:
         att_name = att.get("name", "attachment")
         content_type = (att.get("contentType") or "").lower()
         content_bytes_b64 = att.get("contentBytes", "")
         is_inline = att.get("isInline", False)
-        content_id = att.get("contentId", "")
 
         if not content_bytes_b64:
             log.info("Skipping attachment '%s' (no contentBytes — may be "
@@ -308,9 +283,8 @@ def process_email_attachments_for_inline(message_id):
             log.error("Failed to decode base64 for attachment '%s'", att_name)
             continue
 
-        log.info("Processing attachment '%s' (%s, %d bytes, inline=%s, "
-                 "contentId=%s)", att_name, content_type, len(file_bytes),
-                 is_inline, content_id)
+        log.info("Processing attachment '%s' (%s, %d bytes, inline=%s)",
+                 att_name, content_type, len(file_bytes), is_inline)
 
         # Upload to ADO attachment storage
         ado_url = ado_upload_attachment(att_name, file_bytes)
@@ -318,11 +292,7 @@ def process_email_attachments_for_inline(message_id):
             continue
 
         if content_type in IMAGE_CONTENT_TYPES:
-            # Track cid: -> ADO URL mapping for replacing in body HTML
-            if content_id:
-                cid_map[content_id] = ado_url
-            # Build an <img> tag for inline embedding (used as fallback
-            # for images not referenced via cid: in the body)
+            # Build an <img> tag for inline embedding
             inline_html_parts.append(
                 f'<div style="margin:8px 0;">'
                 f'<img src="{ado_url}" alt="{att_name}" '
@@ -335,137 +305,31 @@ def process_email_attachments_for_inline(message_id):
             file_attachments.append((ado_url, att_name))
 
     inline_html = "\n".join(inline_html_parts)
-    return inline_html, file_attachments, cid_map
-
-
-def build_clean_description(body_html_raw, cid_map, inline_images_html):
-    """Build a clean, simple HTML description that ADO can reliably render.
-
-    Instead of trying to sanitize complex Outlook email HTML (which ADO's
-    UI renderer silently discards even when the API accepts it), we:
-      1. Extract plain text from the email body
-      2. Rebuild simple HTML using only basic tags ADO supports
-      3. Insert inline images using the ADO attachment URLs from cid_map
-    """
-    if not body_html_raw:
-        return inline_images_html or ""
-
-    # --- Step 1: extract the <body> content if wrapped in full HTML doc ---
-    m = re.search(r'<body[^>]*>(.*)</body>', body_html_raw,
-                  flags=re.DOTALL | re.IGNORECASE)
-    body_fragment = m.group(1) if m else body_html_raw
-
-    # --- Step 2: replace cid: refs with ADO URLs BEFORE stripping HTML ---
-    #     This lets us preserve <img> tags that reference uploaded images.
-    if cid_map:
-        for content_id, ado_url in cid_map.items():
-            body_fragment = re.sub(
-                rf'<img[^>]*src="cid:{re.escape(content_id)}[^"]*"[^>]*/?>',
-                f'<img src="{ado_url}" style="max-width:100%;" />',
-                body_fragment,
-                flags=re.IGNORECASE,
-            )
-
-    # --- Step 3: extract text and images in document order ---
-    #     Walk through the HTML, pulling out text runs and <img> tags.
-    parts = []
-    pos = 0
-    # Find every <img> tag (already converted to ADO URLs above)
-    for img_m in re.finditer(r'<img\s[^>]*src="(https://dev\.azure\.com/[^"]+)"[^>]*/?>',
-                             body_fragment, flags=re.IGNORECASE):
-        # Grab text between previous position and this image
-        text_chunk = body_fragment[pos:img_m.start()]
-        text_only = re.sub(r'<[^>]+>', ' ', text_chunk)
-        text_only = re.sub(r'[ \t]+', ' ', text_only).strip()
-        text_only = text_only.replace('&nbsp;', ' ')
-        if text_only:
-            # Convert line breaks to <br> and wrap in <p>
-            paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text_only) if p.strip()]
-            for para in paragraphs:
-                parts.append(f"<p>{para}</p>")
-        # Add the image with simple, clean markup
-        parts.append(
-            f'<p><img src="{img_m.group(1)}" '
-            f'style="max-width:100%;height:auto;" /></p>'
-        )
-        pos = img_m.end()
-
-    # Grab any trailing text after the last image
-    text_chunk = body_fragment[pos:]
-    text_only = re.sub(r'<[^>]+>', ' ', text_chunk)
-    text_only = re.sub(r'[ \t]+', ' ', text_only).strip()
-    text_only = text_only.replace('&nbsp;', ' ')
-    if text_only:
-        paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text_only) if p.strip()]
-        for para in paragraphs:
-            parts.append(f"<p>{para}</p>")
-
-    # --- Step 4: if no ADO-URL images were found in the body, append
-    #     the gallery of all uploaded images as a fallback ---
-    if inline_images_html and not any('dev.azure.com' in p for p in parts):
-        parts.append(inline_images_html)
-
-    result = "\n".join(parts) if parts else "(No text content in email)"
-    return result
-
-
-def replace_cid_references(body_html, cid_map):
-    """Replace cid: image references in email HTML with ADO attachment URLs.
-
-    Email clients embed inline images as <img src="cid:content_id">.
-    This swaps those with the actual ADO attachment URLs so images
-    render correctly in ADO work item descriptions.
-    """
-    if not cid_map or not body_html:
-        return body_html
-
-    for content_id, ado_url in cid_map.items():
-        # Match both cid:content_id and cid:content_id@... forms
-        body_html = re.sub(
-            rf'src="cid:{re.escape(content_id)}[^"]*"',
-            f'src="{ado_url}"',
-            body_html,
-            flags=re.IGNORECASE,
-        )
-    return body_html
-
+    return inline_html, file_attachments
 
 def ado_create_work_item(title, body_html, conversation_id, cleaned_subject,
-                          source, sender_email):
+                         source, sender_email):
     """Create a new ADO work item."""
     patches = [
-        {"op": "add", "path": "/fields/System.Title",
-         "value": title},
-                {"op": "add", "path": "/fields/Microsoft.VSTS.TCM.ReproSteps",
-                          "value": body_html},
-        {"op": "add", "path": "/fields/System.Description",
-         "value": body_html},
+        {"op": "add", "path": "/fields/System.Title", "value": title},
+        {"op": "add", "path": "/fields/System.Description", "value": body_html},
         {"op": "add", "path": "/fields/Custom.TriageConversationID",
          "value": conversation_id or ""},
         {"op": "add", "path": "/fields/Custom.TriageSubject",
          "value": cleaned_subject},
-        {"op": "add", "path": "/fields/Custom.AddTriageSource",
-         "value": source},
+        {"op": "add", "path": "/fields/Custom.AddTriageSource", "value": source},
         {"op": "add", "path": "/fields/Custom.TriageSenderEmail",
          "value": sender_email},
     ]
-    log.info("Creating ADO work item — Description length: %d chars",
-             len(body_html))
-    # Log first 300 chars of description for debugging
-    log.info("Description preview: %.300s", body_html[:300] if body_html else "(empty)")
 
     url = f"{ADO_BASE}/wit/workitems/${ADO_WORK_ITEM_TYPE}?api-version=7.1"
     resp = requests.post(url, json=patches, headers=ado_headers(), timeout=HTTP_TIMEOUT)
     if resp.status_code in (200, 201):
         wi = resp.json()
-        # Check if Description was actually set in the response
-        desc_val = wi.get("fields", {}).get("System.Description", "")
-        log.info("Created work item #%s: %s  (Description in response: %d chars)",
-                 wi["id"], title, len(desc_val or ""))
+        log.info("Created work item #%s: %s", wi["id"], title)
         return wi
     else:
-        log.error("Failed to create work item: %s %s",
-                  resp.status_code, resp.text)
+        log.error("Failed to create work item: %s %s", resp.status_code, resp.text)
         return None
 
 
@@ -504,12 +368,11 @@ def detect_source(subject, body):
 
 
 def send_confirmation_email(to_email, work_item_id, work_item_title,
-                             is_update=False):
+                            is_update=False, source="Email"):
     """Send a confirmation email from triage@ennrgy.com."""
     action = "updated" if is_update else "created"
     wi_url = (f"https://dev.azure.com/{ADO_ORG}/{ADO_PROJECT}"
               f"/_workitems/edit/{work_item_id}")
-
     subject = f"[Triage] Work item #{work_item_id} {action}: {work_item_title}"
     body = (
         f"<p>Your triage request has been {action}.</p>"
@@ -526,6 +389,13 @@ def send_confirmation_email(to_email, work_item_id, work_item_title,
         },
         "saveToSentItems": "false",
     }
+
+    # BCC HubSpot so the confirmation is logged in the CRM contact timeline
+    if source == "HubSpot":
+        message["message"]["bccRecipients"] = [
+            {"emailAddress": {"address": "47665379@bcc.hubspot.com"}}
+        ]
+        log.info("Adding HubSpot BCC for CRM logging")
     url = f"{GRAPH_BASE}/users/{TRIAGE_MAILBOX}/sendMail"
     resp = requests.post(url, json=message, headers=graph_headers(),
                          timeout=HTTP_TIMEOUT)
@@ -535,7 +405,6 @@ def send_confirmation_email(to_email, work_item_id, work_item_title,
     else:
         log.error("Failed to send confirmation: %s %s",
                   resp.status_code, resp.text)
-
 
 # ---------------------------------------------------------------------------
 # Core processing: fetch new mail → create/update ADO item → confirm
@@ -554,33 +423,27 @@ def process_message(message_id):
         return
 
     msg = resp.json()
-    subject        = msg.get("subject", "(no subject)")
-    body_html_raw  = msg.get("body", {}).get("content", "")
-    body_text      = re.sub(r"<[^>]+>", " ", body_html_raw)  # strip HTML for detection
-    body_text      = re.sub(r"\s+", " ", body_text).strip()
+    subject         = msg.get("subject", "(no subject)")
+    body_html       = msg.get("body", {}).get("content", "")
+    body_text       = re.sub(r"<[^>]+>", "", body_html)   # strip HTML for detection
     conversation_id = msg.get("conversationId", "")
-    sender_email   = (msg.get("from", {}).get("emailAddress", {})
-                      .get("address", ""))
-    received_dt    = msg.get("receivedDateTime", "")
+    sender_email    = (msg.get("from", {}).get("emailAddress", {})
+                       .get("address", ""))
+    received_dt     = msg.get("receivedDateTime", "")
 
     # --- Skip our own confirmation emails to prevent infinite loops ---
     if sender_email.lower() == TRIAGE_MAILBOX.lower():
         log.info("Skipping self-sent message from %s: '%s'",
                  sender_email, subject)
         return
-
     if subject.startswith("[Triage]"):
         log.info("Skipping triage confirmation email: '%s'", subject)
         return
 
-    # --- Deduplicate: skip if we already processed this message_id ---
-    if _is_duplicate(message_id):
-        log.info("Skipping duplicate notification for message %s", message_id)
-        return
-
     cleaned_subj = clean_subject(subject)
-    source       = detect_source(subject, body_text)
-    log.info("Processing: '%s' from %s [source=%s]", subject, sender_email, source)
+    source = detect_source(subject, body_text)
+    log.info("Processing: '%s' from %s [source=%s]",
+             subject, sender_email, source)
 
     # Thread matching: try ConversationId first, then cleaned subject
     existing_wi_id = ado_query_by_conversation_id(conversation_id)
@@ -590,42 +453,48 @@ def process_message(message_id):
     # --- Extract email attachments: inline images + file attachments ---
     has_attachments = msg.get("hasAttachments", False)
     if has_attachments:
-        inline_images_html, file_attachments, cid_map = \
+        inline_images_html, file_attachments = \
             process_email_attachments_for_inline(message_id)
     else:
-        inline_images_html, file_attachments, cid_map = "", [], {}
-
-    # Build a clean HTML description from the email content.
-    # Outlook email HTML is too complex for ADO's renderer, so we
-    # extract the text and images and rebuild simple HTML.
-    clean_description = build_clean_description(
-        body_html_raw, cid_map, inline_images_html)
-    log.info("Clean description built: %d chars (raw email: %d chars, "
-             "cid entries: %d)", len(clean_description),
-             len(body_html_raw), len(cid_map))
+        inline_images_html, file_attachments = "", []
 
     if existing_wi_id:
         # Update existing work item with a new comment
         comment = (
             f"<p><strong>New message from {sender_email}</strong> "
             f"({source}, {received_dt or 'unknown time'})</p>"
-            f"<hr>{clean_description}"
+            f"<hr>{body_html}"
         )
+        # Append inline images to the comment
+        if inline_images_html:
+            comment += (
+                f"\n<hr><p><strong>Attachments:</strong></p>"
+                f"\n{inline_images_html}"
+            )
         ado_add_comment(existing_wi_id, comment)
+
         # Attach the actual email (.eml) to the work item
-        attach_email_to_work_item(existing_wi_id, message_id, sender_email,
-                                  cleaned_subj, received_dt)
+        attach_email_to_work_item(existing_wi_id, message_id,
+                                  sender_email, cleaned_subj, received_dt)
+
         # Attach any non-image files
         for ado_url, fname in file_attachments:
             ado_attach_file_to_work_item(existing_wi_id, ado_url,
                                          f"Email attachment: {fname}")
+
         send_confirmation_email(sender_email, existing_wi_id, cleaned_subj,
-                                is_update=True)
+                                is_update=True, source=source)
     else:
-        # Create new work item with clean description
-        description_html = clean_description
-        title = (f"[{source}] {cleaned_subj}" if source != "Email"
-                 else cleaned_subj)
+        # Create new work item — embed images in description
+        description_html = body_html
+        if inline_images_html:
+            description_html += (
+                f"\n<hr><p><strong>Attachments:</strong></p>"
+                f"\n{inline_images_html}"
+            )
+
+        title = (f"[{source}] {cleaned_subj}"
+                 if source != "Email" else cleaned_subj)
         wi = ado_create_work_item(
             title=title,
             body_html=description_html,
@@ -636,15 +505,16 @@ def process_message(message_id):
         )
         if wi:
             # Attach the actual email (.eml) to the new work item
-            attach_email_to_work_item(wi["id"], message_id, sender_email,
-                                      cleaned_subj, received_dt)
+            attach_email_to_work_item(wi["id"], message_id,
+                                      sender_email, cleaned_subj, received_dt)
+
             # Attach any non-image files
             for ado_url, fname in file_attachments:
                 ado_attach_file_to_work_item(wi["id"], ado_url,
                                              f"Email attachment: {fname}")
-            send_confirmation_email(sender_email, wi["id"], title,
-                                    is_update=False)
 
+            send_confirmation_email(sender_email, wi["id"], title,
+                                    is_update=False, source=source)
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -725,9 +595,7 @@ def subscribe():
     }
     resp = requests.post(
         f"{GRAPH_BASE}/subscriptions",
-        json=body,
-        headers=graph_headers(),
-        timeout=HTTP_TIMEOUT,
+        json=body, headers=graph_headers(), timeout=HTTP_TIMEOUT,
     )
     if resp.status_code in (200, 201):
         sub = resp.json()
@@ -757,9 +625,7 @@ def renew():
     }
     resp = requests.patch(
         f"{GRAPH_BASE}/subscriptions/{sub_id}",
-        json=body,
-        headers=graph_headers(),
-        timeout=HTTP_TIMEOUT,
+        json=body, headers=graph_headers(), timeout=HTTP_TIMEOUT,
     )
     if resp.status_code == 200:
         log.info("Subscription renewed: %s", sub_id)
