@@ -254,7 +254,7 @@ def attach_email_to_work_item(work_item_id, message_id, sender_email,
 
     comment = (f"Email from {sender_email} — "
                f"{received_dt or 'unknown time'}")
-    return ado_attach_file_to_work_item(work_item_id, attachment_url, comment))
+    return ado_attach_file_to_work_item(work_item_id, attachment_url, comment)
 
 
 # Image content types that should be embedded inline
