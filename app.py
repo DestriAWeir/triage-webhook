@@ -64,8 +64,8 @@ app = Flask(__name__)
 # Message deduplication — Graph sends at-least-once notifications
 # ---------------------------------------------------------------------------
 _processed_lock = threading.Lock()
-_processed_messages = {}          # message_id → timestamp
-_DEDUP_TTL_SECONDS = 600          # ignore re-delivery within 10 minutes
+_processed_messages = {}  # message_id → timestamp
+_DEDUP_TTL_SECONDS = 600  # ignore re-delivery within 10 minutes
 
 
 def _already_processed(message_id):
@@ -279,7 +279,6 @@ def fetch_email_attachments(message_id):
                   message_id, resp.status_code, resp.text)
         return []
 
-
 def process_email_attachments(message_id, work_item_id):
     """
     Fetch email attachments, upload ALL to ADO and attach as relations,
@@ -386,10 +385,14 @@ def detect_source(subject, body):
         return "Teams"
     return "Email"
 
-
 def send_confirmation_email(to_email, work_item_id, work_item_title,
-                            is_update=False, cc_emails=None):
+                            is_update=False):
     """Send a confirmation email from triage@ennrgy.com."""
+    # to_email may be a single address (str) or a list of addresses
+    if isinstance(to_email, str):
+        recipients = [{"emailAddress": {"address": to_email}}]
+    else:
+        recipients = [{"emailAddress": {"address": e}} for e in to_email]
     action = "updated" if is_update else "created"
     wi_url = (f"https://dev.azure.com/{ADO_ORG}/{ADO_PROJECT}"
               f"/_workitems/edit/{work_item_id}")
@@ -405,14 +408,10 @@ def send_confirmation_email(to_email, work_item_id, work_item_title,
         "message": {
             "subject": subject,
             "body": {"contentType": "HTML", "content": body},
-            "toRecipients": [{"emailAddress": {"address": to_email}}],
+            "toRecipients": recipients,
         },
         "saveToSentItems": "false",
     }
-    if cc_emails:
-        message["message"]["ccRecipients"] = [
-            {"emailAddress": {"address": addr}} for addr in cc_emails
-        ]
     url = f"{GRAPH_BASE}/users/{TRIAGE_MAILBOX}/sendMail"
     resp = requests.post(url, json=message, headers=graph_headers(),
                          timeout=HTTP_TIMEOUT)
@@ -423,10 +422,10 @@ def send_confirmation_email(to_email, work_item_id, work_item_title,
         log.error("Failed to send confirmation: %s %s",
                   resp.status_code, resp.text)
 
-
 # ---------------------------------------------------------------------------
 # Core processing: fetch new mail → create/update ADO item → confirm
 # ---------------------------------------------------------------------------
+
 def process_message(message_id):
     """Fetch a single mail message and process it into ADO."""
     log.info("Fetching message %s from Graph...", message_id)
@@ -441,13 +440,13 @@ def process_message(message_id):
         return
 
     msg = resp.json()
-    subject         = msg.get("subject", "(no subject)")
-    body_html       = msg.get("body", {}).get("content", "")
-    body_text       = re.sub(r"<[^>]+>", "", body_html)   # strip HTML for detection
+    subject = msg.get("subject", "(no subject)")
+    body_html = msg.get("body", {}).get("content", "")
+    body_text = re.sub(r"<[^>]+>", "", body_html)  # strip HTML for detection
     conversation_id = msg.get("conversationId", "")
-    sender_email    = (msg.get("from", {}).get("emailAddress", {})
-                       .get("address", ""))
-    received_dt     = msg.get("receivedDateTime", "")
+    sender_email = (msg.get("from", {}).get("emailAddress", {})
+                    .get("address", ""))
+    received_dt = msg.get("receivedDateTime", "")
 
     # --- Skip our own confirmation emails to prevent infinite loops ---
     if sender_email.lower() == TRIAGE_MAILBOX.lower():
@@ -460,12 +459,14 @@ def process_message(message_id):
 
     cleaned_subj = clean_subject(subject)
     source = detect_source(subject, body_text)
-    log.info("Processing: '%s' from %s [source=%s]",
-             subject, sender_email, source)
+    log.info("Processing: '%s' from %s [source=%s]", subject, sender_email,
+             source)
 
-    # CC list for HubSpot-sourced emails
-    cc_emails = (["cdee@ennrgy.com", "cwaring@ennrgy.com"]
-                 if source == "HubSpot" else None)
+    # For HubSpot, send confirmation to internal team instead of the sender
+    if source == "HubSpot":
+        confirm_to = ["cwaring@ennrgy.com", "cdee@ennrgy.com"]
+    else:
+        confirm_to = sender_email
 
     # Thread matching: try ConversationId first, then cleaned subject
     existing_wi_id = ado_query_by_conversation_id(conversation_id)
@@ -481,11 +482,9 @@ def process_message(message_id):
             f"({source}, {received_dt or 'unknown time'})</p>"
             f"<hr>{body_html}"
         )
-
         # Attach the actual email (.eml) to the work item
-        attach_email_to_work_item(existing_wi_id, message_id,
-                                  sender_email, cleaned_subj, received_dt)
-
+        attach_email_to_work_item(existing_wi_id, message_id, sender_email,
+                                  cleaned_subj, received_dt)
         # Process image/file attachments
         if has_attachments:
             inline_html = process_email_attachments(
@@ -495,11 +494,9 @@ def process_message(message_id):
                     f"\n<hr><p><strong>Attachments:</strong></p>"
                     f"\n{inline_html}"
                 )
-
         ado_add_comment(existing_wi_id, comment)
-
-        send_confirmation_email(sender_email, existing_wi_id, cleaned_subj,
-                                is_update=True, cc_emails=cc_emails)
+        send_confirmation_email(confirm_to, existing_wi_id, cleaned_subj,
+                                is_update=True)
     else:
         # Create new work item
         title = (f"[{source}] {cleaned_subj}"
@@ -514,9 +511,8 @@ def process_message(message_id):
         )
         if wi:
             # Attach the actual email (.eml) to the new work item
-            attach_email_to_work_item(wi["id"], message_id,
-                                      sender_email, cleaned_subj, received_dt)
-
+            attach_email_to_work_item(wi["id"], message_id, sender_email,
+                                      cleaned_subj, received_dt)
             # Process image/file attachments and update description
             if has_attachments:
                 inline_html = process_email_attachments(
@@ -533,17 +529,16 @@ def process_message(message_id):
                                 "value": new_desc}]
                     url = (f"{ADO_BASE}/wit/workitems/{wi['id']}"
                            f"?api-version=7.1")
-                    requests.patch(url, json=patches,
-                                   headers=ado_headers(),
+                    requests.patch(url, json=patches, headers=ado_headers(),
                                    timeout=HTTP_TIMEOUT)
-
-            send_confirmation_email(sender_email, wi["id"], title,
-                                    is_update=False, cc_emails=cc_emails)
+            send_confirmation_email(confirm_to, wi["id"], title,
+                                    is_update=False)
 
 
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
 @app.route("/")
 def index():
     return jsonify({"status": "ok", "service": "ennrgy-triage-webhook"})
@@ -573,7 +568,7 @@ def webhook():
     log.info("Received %d notification(s)", len(notifications))
 
     for notif in notifications:
-        resource    = notif.get("resource", "")
+        resource = notif.get("resource", "")
         change_type = notif.get("changeType", "")
         log.info("Notification: changeType=%s resource=%s",
                  change_type, resource)
@@ -624,7 +619,9 @@ def subscribe():
     }
     resp = requests.post(
         f"{GRAPH_BASE}/subscriptions",
-        json=body, headers=graph_headers(), timeout=HTTP_TIMEOUT,
+        json=body,
+        headers=graph_headers(),
+        timeout=HTTP_TIMEOUT,
     )
     if resp.status_code in (200, 201):
         sub = resp.json()
@@ -654,7 +651,9 @@ def renew():
     }
     resp = requests.patch(
         f"{GRAPH_BASE}/subscriptions/{sub_id}",
-        json=body, headers=graph_headers(), timeout=HTTP_TIMEOUT,
+        json=body,
+        headers=graph_headers(),
+        timeout=HTTP_TIMEOUT,
     )
     if resp.status_code == 200:
         log.info("Subscription renewed: %s", sub_id)
